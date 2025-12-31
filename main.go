@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -12,12 +11,14 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+
+	"github.com/zeebo/blake3"
 )
 
 func main() {
 	root := flag.String("root", ".", "root directory to scan")
 	workers := flag.Int("workers", runtime.GOMAXPROCS(0), "number of hashing workers")
-	quickBytes := flag.Int64("quick-bytes", 4096, "bytes per sample for quick check (0 to disable and hash full sha256 immediately)")
+	quickBytes := flag.Int64("quick-bytes", 4096, "bytes per sample for quick check (0 to disable and hash full BLAKE3 immediately)")
 	flag.Parse()
 
 	if err := run(*root, *workers, *quickBytes); err != nil {
@@ -197,7 +198,7 @@ func scanAndHashOnePass(root string, workers int, quickBytes int64) (recs []hash
 		return nil, quickErrCount, fullErrCount, walkErrCount, fileCount, fmt.Errorf("walk fatal error: %w", walkFatalErr)
 	}
 
-	// Decide which files need the full SHA-256 based on (size, quickSum).
+	// Decide which files need the full hash based on (size, quickSum).
 	sort.Slice(quickRecs, func(i, j int) bool {
 		if quickRecs[i].size != quickRecs[j].size {
 			return quickRecs[i].size < quickRecs[j].size
@@ -208,7 +209,7 @@ func scanAndHashOnePass(root string, workers int, quickBytes int64) (recs []hash
 		return quickRecs[i].path < quickRecs[j].path
 	})
 
-	// Phase 2: full SHA-256 only for quick-collision groups.
+	// Phase 2: full BLAKE3 only for quick-collision groups.
 	fullJobCh := make(chan fileJob, 4096)
 	fullResCh := make(chan hashResult, 4096)
 
@@ -218,7 +219,7 @@ func scanAndHashOnePass(root string, workers int, quickBytes int64) (recs []hash
 		go func() {
 			defer fullWg.Done()
 			for job := range fullJobCh {
-				sum, err := sha256File(job.path)
+				sum, err := blake3File(job.path)
 				fullResCh <- hashResult{
 					rec: hashedRec{size: job.size, sum: sum, path: job.path},
 					err: err,
@@ -285,32 +286,31 @@ func scanAndHashOnePass(root string, workers int, quickBytes int64) (recs []hash
 	return recs, quickErrCount, fullErrCount, walkErrCount, fileCount, nil
 }
 
-func sha256File(path string) ([32]byte, error) {
+func blake3File(path string) ([32]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return [32]byte{}, err
 	}
 	defer f.Close()
 
-	h := sha256.New()
+	h := blake3.New()
 	buf := make([]byte, 1024*1024)
 	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return [32]byte{}, err
 	}
-	sum := h.Sum(nil)
 	var out [32]byte
-	copy(out[:], sum)
+	copy(out[:], h.Sum(nil))
 	return out, nil
 }
 
 func quickDigestFile(path string, size int64, sampleBytes int64) ([32]byte, error) {
 	// If disabled, fall back to full hashing.
 	if sampleBytes <= 0 {
-		return sha256File(path)
+		return blake3File(path)
 	}
 	if size <= 0 {
 		// Empty (or weird negative) file: no need to read from disk.
-		return sha256.Sum256(nil), nil
+		return blake3.Sum256(nil), nil
 	}
 
 	f, err := os.Open(path)
@@ -322,7 +322,7 @@ func quickDigestFile(path string, size int64, sampleBytes int64) ([32]byte, erro
 	// We hash up to 3 samples: start, middle, end.
 	// This avoids reading tens of GiB for non-duplicates while still being very
 	// effective at filtering.
-	h := sha256.New()
+	h := blake3.New()
 
 	readAt := func(off int64, n int64) error {
 		if off < 0 {
@@ -428,7 +428,7 @@ func printDuplicateGroups(recs []hashedRec) (dupGroups int) {
 		}
 		if curCount == 2 {
 			dupGroups++
-			fmt.Printf("Duplicate group (size=%d bytes, sha256=%s):\n", curSize, hex.EncodeToString(curHash[:]))
+			fmt.Printf("Duplicate group (size=%d bytes, blake3=%s):\n", curSize, hex.EncodeToString(curHash[:]))
 			fmt.Printf("  %s\n", firstPath)
 			fmt.Printf("  %s\n", rec.path)
 			groupActive = true
