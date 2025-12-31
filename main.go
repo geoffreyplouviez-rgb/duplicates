@@ -30,27 +30,19 @@ func run(root string, workers int) error {
 		workers = 1
 	}
 
-	sizeCounts, walkErrCount, fileCount, err := countFileSizes(root)
+	recs, hashErrCount, walkErrCount, fileCount, err := scanAndHashOnePass(root, workers)
 	if err != nil {
 		return err
 	}
 	if walkErrCount > 0 {
 		fmt.Fprintf(os.Stderr, "warning: encountered %d errors while walking\n", walkErrCount)
 	}
+	if hashErrCount > 0 {
+		fmt.Fprintf(os.Stderr, "warning: encountered %d errors while hashing\n", hashErrCount)
+	}
 	if fileCount == 0 {
 		fmt.Println("No duplicates found.")
 		return nil
-	}
-
-	recs, hashErrCount, walkErrCount2, err := hashCandidates(root, sizeCounts, workers)
-	if err != nil {
-		return err
-	}
-	if walkErrCount2 > 0 {
-		fmt.Fprintf(os.Stderr, "warning: encountered %d errors while hashing-walk\n", walkErrCount2)
-	}
-	if hashErrCount > 0 {
-		fmt.Fprintf(os.Stderr, "warning: encountered %d errors while hashing\n", hashErrCount)
 	}
 
 	sort.Slice(recs, func(i, j int) bool {
@@ -70,53 +62,7 @@ func run(root string, workers int) error {
 	return nil
 }
 
-// ---- Pass 1: count file sizes ----
-
-func countFileSizes(root string) (sizeCounts map[int64]uint32, walkErrCount int64, fileCount int64, _ error) {
-	sizeCounts = make(map[int64]uint32, 1024)
-
-	walkFn := func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			walkErrCount++
-			fmt.Fprintf(os.Stderr, "walk error: %s: %v\n", path, err)
-			return nil
-		}
-
-		// Skip symlinks to avoid loops / surprising behavior.
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-
-		info, infoErr := d.Info()
-		if infoErr != nil {
-			walkErrCount++
-			fmt.Fprintf(os.Stderr, "stat error: %s: %v\n", path, infoErr)
-			return nil
-		}
-
-		sz := info.Size()
-		if sz < 0 {
-			sz = 0
-		}
-
-		c := sizeCounts[sz]
-		if c < ^uint32(0) {
-			sizeCounts[sz] = c + 1
-		}
-		fileCount++
-		return nil
-	}
-
-	if err := filepath.WalkDir(root, walkFn); err != nil {
-		return nil, walkErrCount + 1, fileCount, fmt.Errorf("walk fatal error: %w", err)
-	}
-	return sizeCounts, walkErrCount, fileCount, nil
-}
-
-// ---- Pass 2: hash only sizes that occur > 1 ----
+// ---- Single-pass: hash only when a size repeats ----
 
 type fileJob struct {
 	path string
@@ -134,7 +80,7 @@ type hashResult struct {
 	err error
 }
 
-func hashCandidates(root string, sizeCounts map[int64]uint32, workers int) (recs []hashedRec, hashErrCount int64, walkErrCount int64, _ error) {
+func scanAndHashOnePass(root string, workers int) (recs []hashedRec, hashErrCount int64, walkErrCount int64, fileCount int64, _ error) {
 	if workers < 1 {
 		workers = 1
 	}
@@ -163,6 +109,9 @@ func hashCandidates(root string, sizeCounts map[int64]uint32, workers int) (recs
 	go func() {
 		defer walkWg.Done()
 
+		firstBySize := make(map[int64]string, 1024)      // size -> first seen path
+		candidateBySize := make(map[int64]struct{}, 512) // sizes we've already started hashing
+
 		walkFn := func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				walkErrCount++
@@ -188,10 +137,20 @@ func hashCandidates(root string, sizeCounts map[int64]uint32, workers int) (recs
 			if sz < 0 {
 				sz = 0
 			}
+			fileCount++
 
-			if sizeCounts[sz] > 1 {
+			if _, ok := candidateBySize[sz]; ok {
 				jobCh <- fileJob{path: path, size: sz}
+				return nil
 			}
+			if first, ok := firstBySize[sz]; ok {
+				delete(firstBySize, sz)
+				candidateBySize[sz] = struct{}{}
+				jobCh <- fileJob{path: first, size: sz}
+				jobCh <- fileJob{path: path, size: sz}
+				return nil
+			}
+			firstBySize[sz] = path
 			return nil
 		}
 
@@ -215,10 +174,10 @@ func hashCandidates(root string, sizeCounts map[int64]uint32, workers int) (recs
 
 	walkWg.Wait()
 	if walkFatalErr != nil {
-		return nil, hashErrCount, walkErrCount, fmt.Errorf("walk fatal error: %w", walkFatalErr)
+		return nil, hashErrCount, walkErrCount, fileCount, fmt.Errorf("walk fatal error: %w", walkFatalErr)
 	}
 
-	return recs, hashErrCount, walkErrCount, nil
+	return recs, hashErrCount, walkErrCount, fileCount, nil
 }
 
 func sha256File(path string) ([32]byte, error) {
